@@ -3,6 +3,8 @@
 
 Usage: patch-workspace.py WORKSPACE
 - ServiceLoader.findFirst(): registers the donor in loader/teavm-compat with Eaglercraft's JdkMethodInjector.
+- Pattern.asPredicate/asMatchPredicate (Eaglercraft's donor): returned null, because the lambda it
+  returned doesn't survive being copied into Pattern; now returns a plain class (AppleSkin needs it).
 - glfwGetMouseButton(): added to Eaglercraft's GLFW stand-in.
 - Arrays.copyOfRange (replace-donor in loader/teavm-compat): pads with zeros past the end, as the JDK
   does, instead of throwing (SnakeYAML relies on it).
@@ -59,6 +61,13 @@ def main():
           "Arrays.copyOfRange fix")
 
     inject = os.path.join(ws, "teavm-compat/src/main/java/net/lax1dude/eaglercraft/v1_8/teavmcompat/inject")
+    pi = os.path.join(inject, "PatternInject.java")
+    patch(pi, "return input -> ((Pattern) (Object) this).matcher(input).find();",
+          "return net.lax1dude.eaglercraft.v1_8.teavmcompat.EmlPatternPredicate.find(this); // eagler-modloader",
+          "Pattern.asPredicate fix")
+    patch(pi, "return input -> ((Pattern) (Object) this).matcher(input).matches();",
+          "return net.lax1dude.eaglercraft.v1_8.teavmcompat.EmlPatternPredicate.matches(this); // eagler-modloader",
+          "Pattern.asMatchPredicate fix")
     setters = "".join(
         "\n\tpublic static void set%s(Object array, int index, %s value) { // added by eagler-modloader\n"
         "\t\tjava.lang.reflect.Array.set(array, index, %s.valueOf(value));\n\t}\n" % (n, t, b)
