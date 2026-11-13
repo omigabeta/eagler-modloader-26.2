@@ -34,8 +34,6 @@ env:
   # The Eaglercraft 26.2 workspace is downloaded at build time and never committed here.
   WORKSPACE_REPO: https://github.com/kingjoeishere/Eaglercraft-26.2-Workspace
   WORKSPACE_COMMIT: f73bff91f0f0840bc958c09ab536dbba1e146b2e
-  # the most memory the workspace's browser compiler step allows (default 12288)
-  EAGLER_LINK_HEAP_MIB: "12544"
 
 jobs:
   build:
