@@ -19,5 +19,8 @@ autogg-fabric            # AutoGG
 nopeeking                # Password Hider
 emoji-type               # Emoji Type
 simple-item-editor       # Item Editor
-replaymod                # Replay Mod (record and replay)
-sodium                   # Sodium (performance)
+# Not included: Replay Mod and Sodium. Together they made the browser compiler run out of memory
+# (Replay Mod bundles a web server, Guava and image libraries; Sodium replaces the renderer with
+# desktop OpenGL code the browser doesn't have). Replay Mod's video export also needs ffmpeg.
+# replaymod
+# sodium
