@@ -71,6 +71,10 @@ final class ReflectionScan {
 			ClassNode cn = new ClassNode();
 			new ClassReader(b).accept(cn, 0);
 			boolean changed = false;
+			// libraries bundled inside mods (ReplayMod ships a web server, Guava, image readers, ...) name
+			// classes everywhere for their own loggers and internals; they don't decide what mods reflect on,
+			// and counting them made the program too big for the compiler's memory
+			boolean library = isLibrary(name);
 			for (MethodNode m : cn.methods) {
 				boolean lists = false;
 				Set<String> named = new TreeSet<>();
@@ -106,13 +110,13 @@ final class ReflectionScan {
 						if (ft.getSort() == Type.OBJECT) named.add(ft.getInternalName());
 					}
 				}
-				if (lists) {
+				if (lists && !library) {
 					reflected.add(cn.name);
 					for (String n : named) if (!n.startsWith("java/") && !isGame(n)) reflected.add(n);
 				}
 				// a mod class named as a class literal (Config.class) is nearly always handed to a library
 				// that uses reflection on it (Cloth Config's AutoConfig.register, YACL, Gson, ...)
-				for (AbstractInsnNode in = m.instructions.getFirst(); in != null; in = in.getNext()) {
+				for (AbstractInsnNode in = library ? null : m.instructions.getFirst(); in != null; in = in.getNext()) {
 					if (in instanceof LdcInsnNode ldc && ldc.cst instanceof Type t && t.getSort() == Type.OBJECT) {
 						String n = t.getInternalName();
 						if (!n.startsWith("java/") && !isGame(n)) reflected.add(n);
@@ -148,7 +152,7 @@ final class ReflectionScan {
 			for (String n : more) {
 				if (n.startsWith("java/") || isGame(n) || reflected.contains(n) || read(classes, n, cache) == null) continue;
 				reflected.add(n);
-				todo.add(n);
+				if (!isLibrary(n)) todo.add(n); // a library's own fields aren't settings
 			}
 		}
 		StringBuilder out = new StringBuilder();
@@ -171,6 +175,18 @@ final class ReflectionScan {
 		Files.write(classes.resolve("eml-reflect.txt"), out.toString().getBytes(StandardCharsets.UTF_8));
 		System.out.println("[compat] reflection: " + reflected.size() + " classes readable by reflection, " + generic
 				+ " generic field types, " + rewired + " getGenericType calls rewired, " + resources + " getResourceAsStream calls pointed at the mods' files");
+	}
+
+	private static final String[] LIBRARY_ROOTS = { "com/google/", "org/apache/", "org/eclipse/", "io/netty/", "it/unimi/",
+			"com/twelvemonkeys/", "org/slf4j/", "org/objectweb/", "com/llamalad7/", "org/yaml/", "com/github/benmanes/",
+			"javax/", "org/jetbrains/", "org/intellij/", "kotlin/", "org/joml/", "org/lwjgl/", "com/electronwill/" };
+	private static final String[] LIBRARY_PARTS = { "/lib/", "/libs/", "/shadow/", "/shadowed/", "/shaded/", "/repack/",
+			"/repackaged/", "/relocated/", "/thirdparty/", "/third_party/", "/external/" };
+
+	static boolean isLibrary(String name) {
+		for (String r : LIBRARY_ROOTS) if (name.startsWith(r)) return true;
+		for (String r : LIBRARY_PARTS) if (name.contains(r)) return true;
+		return false;
 	}
 
 	private static boolean isGame(String name) {
