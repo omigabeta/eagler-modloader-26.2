@@ -21,6 +21,8 @@ Usage: patch-workspace.py WORKSPACE
 - WebGL2Program: a shader that fails to compile is retried with whole numbers made decimal on the lines
   the compiler complained about (desktop GLSL turns 1 into 1.0 next to a float; the browser's GLSL ES
   doesn't, and mods' shaders such as Impact Frames' rely on it). Shaders that compile are untouched.
+- TeaVMWebSocketClient: socket events are queued in JavaScript and applied from the game's loop, not in
+  the browser's callbacks (a message arriving while the game waited on IndexedDB crashed it on busy servers).
 - StandaloneTeaVMLinker: classes or methods the browser doesn't have, used by mods, no longer stop the
   build. TeaVM compiles each such spot to throw NoClassDefFoundError/NoSuchMethodError if it runs; the
   build log lists them ("was not found"). Any other compiler error still stops the build.
@@ -276,6 +278,114 @@ def main():
 		return line.startsWith(op, k);
 	}
 """, "static String emlFloatLiterals(", "shader whole-number helper")
+    # WebSocket events are queued in JavaScript and handed to the game from its own loop (emlPoll), instead
+    # of running game code inside the browser's event callbacks: a server message arriving while the game
+    # was paused waiting on the browser (saving options to IndexedDB) re-entered it and crashed it
+    # (illegal cast in TeaVMWebSocketClient$3, Fiber stack overflow), on busy servers.
+    wsc = os.path.join(ws, "platform-teavm/src/main/java/net/lax1dude/eaglercraft/v1_8/internal/teavm/TeaVMWebSocketClient.java")
+    patch(wsc, "import org.teavm.jso.JSBody;\n", "import org.teavm.jso.JSBody;\nimport org.teavm.jso.JSObject;\nimport org.teavm.jso.core.JSArrayReader;\nimport java.util.List;\nimport net.lax1dude.eaglercraft.v1_8.internal.IWebSocketFrame;\n", "websocket imports")
+    s = open(wsc).read()
+    a = s.find("\t\topenListener = new EventListener<Event>() {")
+    b = s.find("\t\tsock.addEventListener(\"error\", errorListener);\n")
+    if "emlQueue = emlListen(sock);" not in s:
+        if a < 0 or b < 0:
+            sys.exit("eagler-modloader: TeaVMWebSocketClient.java changed; check the websocket queue patch")
+        b += len("\t\tsock.addEventListener(\"error\", errorListener);\n")
+        s = s[:a] + "\t\topenListener = null;\n\t\tcloseListener = null;\n\t\tmessageListener = null;\n\t\terrorListener = null;\n\t\temlQueue = emlListen(sock);\n" + s[b:]
+        open(wsc, "w").write(s)
+    patch(wsc, "\tprivate boolean closeStarted;\n", "\tprivate boolean closeStarted;\n\tprivate JSObject emlQueue;\n", "websocket queue field")
+    patch(wsc, "\t\tclearFrames();\n\t\tcloseSocketAfterCallback(sock, openListener, closeListener, messageListener, errorListener);",
+        "\t\tclearFrames();\n\t\temlCloseLater(sock, emlQueue);", "websocket queue close")
+    patch(wsc, "\t\twhile(sockIsConnecting && !sockIsConnected && !sockIsFailed) {\n\t\t\tEagUtils.sleep(50);",
+        "\t\temlPoll();\n\t\twhile(sockIsConnecting && !sockIsConnected && !sockIsFailed) {\n\t\t\tEagUtils.sleep(50);\n\t\t\temlPoll();", "websocket queue connect")
+    patch(wsc, "\t\t\twhile(closeCode == 0 && PlatformRuntime.steadyTimeMillis() < closeDeadline) {\n\t\t\t\tEagUtils.sleep(10);",
+        "\t\t\twhile(closeCode == 0 && PlatformRuntime.steadyTimeMillis() < closeDeadline) {\n\t\t\t\tEagUtils.sleep(10);\n\t\t\t\temlPoll();", "websocket queue connect close")
+    for sig in ["public EnumEaglerConnectionState getState() {\n", "public boolean isOpen() {\n", "public boolean isClosed() {\n",
+                "public int getCloseCode() {\n", "public String getCloseReason() {\n", "public void send(String str) {\n", "public void send(byte[] bytes) {\n"]:
+        patch(wsc, "\t" + sig, "\t" + sig + "\t\temlPoll();\n", "websocket queue " + sig.split("(")[0])
+    append_to_class(wsc, r'''
+	// eagler-modloader: the socket's events, queued in JavaScript (see emlPoll)
+	@JSBody(params = { "sock" }, script =
+			"var q = { ev: [], fns: null };"
+			+ "var fo = function() { q.ev.push({ t: 0 }); };"
+			+ "var fc = function(e) { q.ev.push({ t: 1, c: (e && e.code) | 0, r: e && e.reason != null ? String(e.reason) : null }); };"
+			+ "var fm = function(e) { q.ev.push({ t: 2, d: e.data }); };"
+			+ "var fe = function() { q.ev.push({ t: 3 }); };"
+			+ "q.fns = [fo, fc, fm, fe];"
+			+ "sock.addEventListener('open', fo); sock.addEventListener('close', fc);"
+			+ "sock.addEventListener('message', fm); sock.addEventListener('error', fe);"
+			+ "return q;")
+	private static native JSObject emlListen(WebSocket sock);
+
+	@JSBody(params = { "q" }, script = "var a = q.ev; q.ev = []; return a;")
+	private static native JSArrayReader<JSObject> emlTake(JSObject q);
+
+	@JSBody(params = { "e" }, script = "return e.t;")
+	private static native int emlType(JSObject e);
+
+	@JSBody(params = { "e" }, script = "return e.d;")
+	private static native JSObject emlData(JSObject e);
+
+	@JSBody(params = { "e" }, script = "return e.c;")
+	private static native int emlCode(JSObject e);
+
+	@JSBody(params = { "e" }, script = "return e.r;")
+	private static native String emlReason(JSObject e);
+
+	@JSBody(params = { "socket", "q" }, script =
+			"var types = ['open', 'close', 'message', 'error'];"
+			+ "if (q && q.fns) for (var i = 0; i < 4; i++) { try { socket.removeEventListener(types[i], q.fns[i]); } catch (e) {} }"
+			+ "if (q) q.ev = [];"
+			+ "var closeLater = function() { var state;"
+			+ " try { state = socket.readyState; } catch (e) { return; }"
+			+ " if (state === 2 || state === 3) return;"
+			+ " try { socket.close(); } catch (e) {} };"
+			+ "try { if (typeof queueMicrotask === 'function') queueMicrotask(closeLater);"
+			+ " else setTimeout(closeLater, 0); } catch (e) {"
+			+ " try { setTimeout(closeLater, 0); } catch (ignored) {} }")
+	private static native void emlCloseLater(WebSocket socket, JSObject q);
+
+	/** Applies the socket's queued events, in order, on the game's own thread. */
+	private void emlPoll() {
+		if (closeStarted || emlQueue == null) return;
+		JSArrayReader<JSObject> evs = emlTake(emlQueue);
+		int n = evs.getLength();
+		for (int i = 0; i < n; i++) {
+			JSObject e = evs.get(i);
+			switch (emlType(e)) {
+			case 0:
+				sockIsConnecting = false;
+				sockIsConnected = true;
+				break;
+			case 1:
+				sockIsConnecting = false;
+				sockIsConnected = false;
+				closeCode = emlCode(e);
+				closeReason = emlReason(e);
+				break;
+			case 2:
+				addRecievedFrame(new TeaVMWebSocketFrame(emlData(e)));
+				break;
+			default:
+				if (sockIsConnecting) {
+					sockIsFailed = true;
+					sockIsConnecting = false;
+				}
+				break;
+			}
+		}
+	}
+
+	@Override public int availableFrames() { emlPoll(); return super.availableFrames(); }
+	@Override public IWebSocketFrame getNextFrame() { emlPoll(); return super.getNextFrame(); }
+	@Override public List<IWebSocketFrame> getNextFrames() { emlPoll(); return super.getNextFrames(); }
+	@Override public int availableStringFrames() { emlPoll(); return super.availableStringFrames(); }
+	@Override public IWebSocketFrame getNextStringFrame() { emlPoll(); return super.getNextStringFrame(); }
+	@Override public List<IWebSocketFrame> getNextStringFrames() { emlPoll(); return super.getNextStringFrames(); }
+	@Override public int availableBinaryFrames() { emlPoll(); return super.availableBinaryFrames(); }
+	@Override public IWebSocketFrame getNextBinaryFrame() { emlPoll(); return super.getNextBinaryFrame(); }
+	@Override public List<IWebSocketFrame> getNextBinaryFrames() { emlPoll(); return super.getNextBinaryFrames(); }
+''', "private void emlPoll()", "websocket queue helpers")
     print("workspace: ServiceLoader.findFirst, Reader.transferTo, Array setters, Files.newDirectoryStream, glfwGetMouseButton,"
           " datapack functions, shader whole numbers; mods' missing classes don't stop the build")
 
